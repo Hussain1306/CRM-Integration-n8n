@@ -1,0 +1,870 @@
+{
+  "name": "AI Lead Intake -> Zoho CRM (Retries, Fallbacks, HITL)",
+  "nodes": [
+    {
+      "id": "dd14cac8-fa49-44b6-b542-d2c5f45b73ea",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        -260
+      ],
+      "parameters": {
+        "width": 760,
+        "height": 300,
+        "content": "## AI Lead Intake \u2192 Zoho CRM (production-grade)\n**Flow:** Webhook \u2192 validate \u2192 enrich (Apollo \u2192 Hunter fallback) \u2192 AI score (OpenAI \u2192 rules fallback) \u2192 HITL approval for hot/low-confidence leads \u2192 Zoho upsert (4 retries) \u2192 follow-up task \u2192 on CRM failure: queue to Google Sheet + critical email.\n\n**Setup:** connect credentials (Zoho OAuth2, Gmail, Apollo header auth, Hunter query auth, OpenAI, Google Sheets), set approver email, sheet ID, and the Error Workflow in Settings.\nZoho data center: change `zohoapis.com` to `.eu` / `.in` / `.com.au` if needed."
+      }
+    },
+    {
+      "id": "8c2a933b-ffce-4ce5-9185-6cdb708ab8d1",
+      "name": "Lead Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "670f318b-e629-44b6-9a1e-0d000d2befba"
+    },
+    {
+      "id": "32d1ba9f-f06b-489e-a6a0-4ac6e2074525",
+      "name": "Validate & Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        200
+      ],
+      "parameters": {
+        "jsCode": "\nconst b = $input.first().json.body || $input.first().json;\nconst clean = s => (s ?? '').toString().trim();\nconst email = clean(b.email).toLowerCase();\nconst emailOk = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/.test(email);\nconst free = ['gmail.com','yahoo.com','outlook.com','hotmail.com','icloud.com','proton.me','live.com'];\nconst domain = email.split('@')[1] || '';\nconst fullName = clean(b.name);\nconst parts = fullName.split(/\\s+/).filter(Boolean);\nreturn [{ json: {\n  valid: emailOk && parts.length > 0,\n  errors: [...(emailOk ? [] : ['invalid_email']), ...(parts.length ? [] : ['missing_name'])],\n  firstName: parts.length > 1 ? parts[0] : '',\n  lastName: parts.length > 1 ? parts.slice(1).join(' ') : (parts[0] || ''),\n  fullName, email, domain, isFreeMail: free.includes(domain),\n  phone: clean(b.phone), company: clean(b.company),\n  message: clean(b.message).slice(0, 2000),\n  source: clean(b.source) || 'Web Form',\n  receivedAt: new Date().toISOString()\n}}];\n"
+      }
+    },
+    {
+      "id": "92d239af-8255-49cd-8b42-a101d2754adf",
+      "name": "Valid Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "385437ff-d756-4ea8-b38c-73b28f2b9e6b",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "d015c7a5-a904-499a-a1db-0c4375f2a2fe",
+      "name": "Respond 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        380
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, errors: $json.errors }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "5dd4b2c8-ed6a-442a-bfb2-035f9db7863e",
+      "name": "Respond 202",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        120
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, status: 'accepted' }) }}",
+        "options": {
+          "responseCode": 202
+        }
+      }
+    },
+    {
+      "id": "a3ad2d67-63ae-49c4-b7c6-c338f16f967d",
+      "name": "Enrich - Apollo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.apollo.io/api/v1/people/match",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ email: $json.email, first_name: $json.firstName, last_name: $json.lastName, organization_name: $json.company }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE",
+          "name": "Apollo API Key (x-api-key)"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "b9ed475a-dff8-4640-a548-10a8d618f349",
+      "name": "Enrich - Hunter (fallback)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        260
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.hunter.io/v2/people/find",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "email",
+              "value": "={{ $('Validate & Normalize').first().json.email }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "REPLACE",
+          "name": "Hunter API Key (api_key)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "cc34c3fb-fb09-4436-afa2-debbc981307c",
+      "name": "Consolidate Enrichment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        120
+      ],
+      "parameters": {
+        "jsCode": "\nconst base = $('Validate & Normalize').first().json;\nconst j = $input.first().json || {};\nlet enrich = { provider: 'none', title: '', seniority: '', linkedin: '', companyName: '', industry: '', employees: null };\nif (j.person) {\n  const p = j.person, o = p.organization || {};\n  enrich = { provider: 'apollo', title: p.title || '', seniority: p.seniority || '', linkedin: p.linkedin_url || '',\n             companyName: o.name || '', industry: o.industry || '', employees: o.estimated_num_employees || null };\n} else if (j.data && !j.error) {\n  const d = j.data;\n  enrich = { provider: 'hunter', title: d.employment?.title || d.position || '',\n             seniority: d.employment?.seniority || '',\n             linkedin: d.linkedin?.handle ? `https://linkedin.com/in/${d.linkedin.handle}` : '',\n             companyName: d.employment?.name || '', industry: '', employees: null };\n}\nreturn [{ json: { ...base, enrich } }];\n"
+      }
+    },
+    {
+      "id": "4d6a6135-c213-492a-b66b-39e82ede52b5",
+      "name": "AI Score - OpenAI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'gpt-4o-mini', temperature: 0.2, response_format: { type: 'json_object' }, messages: [ { role: 'system', content: \"You are a B2B lead qualification analyst. Score the lead 0-100 on buying intent and fit. Return ONLY valid JSON: {\\\"score\\\":number,\\\"tier\\\":\\\"hot|warm|cold\\\",\\\"confidence\\\":number 0-1,\\\"summary\\\":string (max 40 words),\\\"nextAction\\\":string,\\\"spam\\\":boolean}. hot>=75, warm 45-74, cold<45. Mark spam=true for gibberish, SEO/pitch spam or fake data.\" }, { role: 'user', content: JSON.stringify($json) } ] }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE",
+          "name": "OpenAI account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "af00251e-a4c8-4674-88ed-1306f6d6ca48",
+      "name": "Parse AI Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        40
+      ],
+      "parameters": {
+        "jsCode": "\nfunction rules(l) {\n  let s = 20;\n  if (!l.isFreeMail) s += 20;\n  if (l.company) s += 10;\n  if (l.phone) s += 10;\n  if (/budget|quote|pricing|demo|urgent|asap|proposal|hire/i.test(l.message)) s += 20;\n  if (/(ceo|founder|owner|director|head|vp|chief|manager)/i.test(l.enrich.title || '')) s += 15;\n  if ((l.enrich.employees || 0) >= 50) s += 5;\n  s = Math.min(s, 100);\n  return { score: s, tier: s >= 75 ? 'hot' : s >= 45 ? 'warm' : 'cold', confidence: 0.4,\n           summary: 'Rule-based score (AI unavailable)', nextAction: 'Review manually', spam: false, scoringMode: 'rules' };\n}\n\nconst l = $('Consolidate Enrichment').first().json;\nlet r = null;\ntry { r = JSON.parse($input.first().json.choices[0].message.content); } catch (e) {}\nif (!r || typeof r.score !== 'number' || !['hot','warm','cold'].includes(r.tier)) {\n  return [{ json: rules(l) }];   // fallback if AI output is malformed\n}\nreturn [{ json: { score: r.score, tier: r.tier, confidence: Number(r.confidence ?? 0.7), summary: r.summary || '',\n                  nextAction: r.nextAction || '', spam: !!r.spam, scoringMode: 'ai' } }];\n"
+      }
+    },
+    {
+      "id": "469c72ed-6fd4-498f-990c-6056f43241a0",
+      "name": "Rule-Based Score (fallback)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        240
+      ],
+      "parameters": {
+        "jsCode": "\nfunction rules(l) {\n  let s = 20;\n  if (!l.isFreeMail) s += 20;\n  if (l.company) s += 10;\n  if (l.phone) s += 10;\n  if (/budget|quote|pricing|demo|urgent|asap|proposal|hire/i.test(l.message)) s += 20;\n  if (/(ceo|founder|owner|director|head|vp|chief|manager)/i.test(l.enrich.title || '')) s += 15;\n  if ((l.enrich.employees || 0) >= 50) s += 5;\n  s = Math.min(s, 100);\n  return { score: s, tier: s >= 75 ? 'hot' : s >= 45 ? 'warm' : 'cold', confidence: 0.4,\n           summary: 'Rule-based score (AI unavailable)', nextAction: 'Review manually', spam: false, scoringMode: 'rules' };\n}\n\nconst l = $('Consolidate Enrichment').first().json;\nreturn [{ json: rules(l) }];\n"
+      }
+    },
+    {
+      "id": "4a73ee7c-ffdd-47f0-b55a-a9207609600c",
+      "name": "Build Zoho Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        120
+      ],
+      "parameters": {
+        "jsCode": "\nconst l = $('Consolidate Enrichment').first().json;\nconst s = $input.first().json;\nconst tier = s.spam ? 'cold' : s.tier;\nconst needsReview = !s.spam && (tier === 'hot' || s.confidence < 0.5);\nconst desc = [\n  `AI score: ${s.score}/100 (${tier}) [${s.scoringMode}]`,\n  s.summary,\n  `Next action: ${s.nextAction}`,\n  `Source: ${l.source}`,\n  l.message ? `Message: ${l.message}` : '',\n  l.enrich.linkedin ? `LinkedIn: ${l.enrich.linkedin}` : '',\n  `Enrichment: ${l.enrich.provider}`\n].filter(Boolean).join('\\n');\nconst record = {\n  Last_Name: l.lastName || l.fullName,\n  First_Name: l.firstName || undefined,\n  Email: l.email,\n  Phone: l.phone || undefined,\n  Company: l.company || l.enrich.companyName || 'Unknown',\n  Designation: l.enrich.title || undefined,\n  Industry: l.enrich.industry || undefined,\n  Lead_Status: tier === 'hot' ? 'Pre-Qualified' : tier === 'warm' ? 'Not Contacted' : 'Contact in Future',\n  Description: desc\n};\nreturn [{ json: { l, ai: s, tier, needsReview, record,\n  zohoBody: { data: [record], duplicate_check_fields: ['Email'], trigger: ['workflow'] } } }];\n"
+      }
+    },
+    {
+      "id": "37335212-3545-48c4-9135-14f70b5c68fc",
+      "name": "Needs Human Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2400,
+        120
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "7c391e51-a812-4d4a-a841-9a11dd932fe2",
+              "leftValue": "={{ $json.needsReview }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "7b57ccc1-da32-499c-a9e1-fbac23e57f3c",
+      "name": "HITL - Approve Lead (Gmail)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2640,
+        20
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendAndWait",
+        "sendTo": "approver@yourcompany.com",
+        "subject": "=Approve lead: {{ $json.l.fullName }} ({{ $json.l.company || 'n/a' }}) - score {{ $json.ai.score }}",
+        "message": "=Lead: {{ $json.l.fullName }}\nEmail: {{ $json.l.email }}\nCompany: {{ $json.l.company }}\nTitle: {{ $json.l.enrich.title }}\nScore: {{ $json.ai.score }} ({{ $json.tier }}, confidence {{ $json.ai.confidence }}, mode {{ $json.ai.scoringMode }})\n\nAI summary: {{ $json.ai.summary }}\nMessage: {{ $json.l.message }}\n\nApprove to fast-track in Zoho CRM (Pre-Qualified + follow-up task). Decline to push to nurture.",
+        "responseType": "approval",
+        "approvalOptions": {
+          "values": {
+            "approvalType": "double",
+            "approveLabel": "Approve",
+            "disapproveLabel": "Decline"
+          }
+        },
+        "options": {
+          "limitWaitTime": {
+            "values": {
+              "limitType": "afterTimeInterval",
+              "resumeAmount": 24,
+              "resumeUnit": "hours"
+            }
+          }
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "webhookId": "fed3b22e-2551-40d7-b09a-8d3454a14261"
+    },
+    {
+      "id": "f9297f96-67af-4e47-a09e-8bd47fa3e72b",
+      "name": "Apply HITL Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        20
+      ],
+      "parameters": {
+        "jsCode": "\nconst p = $('Build Zoho Payload').first().json;\nconst approved = $input.first().json?.data?.approved === true;   // timeout / decline => false\nconst rec = { ...p.record };\nrec.Lead_Status = approved ? 'Pre-Qualified' : 'Contact in Future';\nrec.Description += `\\nHITL decision: ${approved ? 'APPROVED' : 'DECLINED / no response'}`;\nreturn [{ json: { ...p, approved, tier: approved ? p.tier : 'warm', record: rec,\n  zohoBody: { data: [rec], duplicate_check_fields: ['Email'], trigger: ['workflow'] } } }];\n"
+      }
+    },
+    {
+      "id": "0324b986-5901-4691-97c5-168ae02ea920",
+      "name": "Zoho - Upsert Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3120,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.zohoapis.com/crm/v6/Leads/upsert",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "zohoOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.zohoBody) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "zohoOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Zoho CRM account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "79f3d489-2e0f-4fbb-80e2-6df6c1bdc42c",
+      "name": "Check Zoho Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        40
+      ],
+      "parameters": {
+        "jsCode": "const p = $('Apply HITL Decision').isExecuted ? $('Apply HITL Decision').first().json : $('Build Zoho Payload').first().json;\n\nconst r = $input.first().json?.data?.[0] || {};\nconst ok = r.code === 'SUCCESS';\nreturn [{ json: { ...p, zoho: { ok, id: r.details?.id, action: r.action, code: r.code, message: r.message } } }];\n"
+      }
+    },
+    {
+      "id": "809a1384-88f7-4154-8df7-b2fb27aa323c",
+      "name": "Zoho OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3600,
+        40
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "462c639e-cf35-4cc9-8644-b0e2e1765483",
+              "leftValue": "={{ $json.zoho.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "1401eb49-ac09-476b-bcfc-1b0c8a498510",
+      "name": "Hot & Not Declined?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3840,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "79d1250a-6774-433d-8f71-d4062c2b9d00",
+              "leftValue": "={{ $json.tier === 'hot' && $json.approved !== false }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "048a84f7-13b7-438b-a1c7-71f915ff147c",
+      "name": "Build Follow-up Task",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        -40
+      ],
+      "parameters": {
+        "jsCode": "\nconst p = $input.first().json;\nconst due = new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 10);\nreturn [{ json: { ...p, taskBody: { data: [{\n  Subject: `Call hot lead: ${p.l.fullName} (${p.l.company || 'n/a'})`,\n  Due_Date: due, Priority: 'High', Status: 'Not Started',\n  Description: p.ai.summary, What_Id: { id: p.zoho.id }, '$se_module': 'Leads'\n}] } } }];\n"
+      }
+    },
+    {
+      "id": "302a1c9e-c8ae-4b24-9db7-0dc1d62cffe3",
+      "name": "Zoho - Create Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4320,
+        -40
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.zohoapis.com/crm/v6/Tasks",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "zohoOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.taskBody) }}",
+        "options": {}
+      },
+      "credentials": {
+        "zohoOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Zoho CRM account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "86f96216-b741-4ef2-a6ba-efeba3cc2fda",
+      "name": "Prepare Fallback Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const p = $('Apply HITL Decision').isExecuted ? $('Apply HITL Decision').first().json : $('Build Zoho Payload').first().json;\n\nconst j = $input.first().json;\nconst reason = j.zoho ? `${j.zoho.code}: ${j.zoho.message}` : (j.error?.message || j.error || j.message || 'Unknown Zoho error');\nreturn [{ json: { queuedAt: new Date().toISOString(), email: p.l.email, name: p.l.fullName, tier: p.tier,\n  score: p.ai.score, reason: String(reason).slice(0, 500), payload: JSON.stringify(p.zohoBody) } }];\n"
+      }
+    },
+    {
+      "id": "ee3f52ae-a81b-4517-8abb-e9df617c3d91",
+      "name": "Fallback - Queue in Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3840,
+        300
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "CRM_Fallback_Queue"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "140d0a1d-2c6a-47e2-8f9e-459a1bfe2af6",
+      "name": "Alert - CRM Write Failed",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        4080,
+        300
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "alerts@yourcompany.com",
+        "subject": "=[CRITICAL] Zoho CRM write failed - lead queued: {{ $('Prepare Fallback Record').first().json.email }}",
+        "emailType": "text",
+        "message": "=Zoho CRM write failed after 4 retries. Lead saved in the CRM_Fallback_Queue sheet.\n\nEmail: {{ $('Prepare Fallback Record').first().json.email }}\nTier: {{ $('Prepare Fallback Record').first().json.tier }}\nReason: {{ $('Prepare Fallback Record').first().json.reason }}\n\nCommon causes: expired Zoho OAuth token, missing mandatory field, API credits exhausted.",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Lead Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate & Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Normalize": {
+      "main": [
+        [
+          {
+            "node": "Valid Lead?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid Lead?": {
+      "main": [
+        [
+          {
+            "node": "Respond 202",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 400",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond 202": {
+      "main": [
+        [
+          {
+            "node": "Enrich - Apollo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich - Apollo": {
+      "main": [
+        [
+          {
+            "node": "Consolidate Enrichment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Enrich - Hunter (fallback)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich - Hunter (fallback)": {
+      "main": [
+        [
+          {
+            "node": "Consolidate Enrichment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consolidate Enrichment": {
+      "main": [
+        [
+          {
+            "node": "AI Score - OpenAI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Score - OpenAI": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Score",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Rule-Based Score (fallback)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Score": {
+      "main": [
+        [
+          {
+            "node": "Build Zoho Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rule-Based Score (fallback)": {
+      "main": [
+        [
+          {
+            "node": "Build Zoho Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Zoho Payload": {
+      "main": [
+        [
+          {
+            "node": "Needs Human Review?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Human Review?": {
+      "main": [
+        [
+          {
+            "node": "HITL - Approve Lead (Gmail)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Zoho - Upsert Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HITL - Approve Lead (Gmail)": {
+      "main": [
+        [
+          {
+            "node": "Apply HITL Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply HITL Decision": {
+      "main": [
+        [
+          {
+            "node": "Zoho - Upsert Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zoho - Upsert Lead": {
+      "main": [
+        [
+          {
+            "node": "Check Zoho Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Fallback Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Zoho Result": {
+      "main": [
+        [
+          {
+            "node": "Zoho OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zoho OK?": {
+      "main": [
+        [
+          {
+            "node": "Hot & Not Declined?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Fallback Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hot & Not Declined?": {
+      "main": [
+        [
+          {
+            "node": "Build Follow-up Task",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Follow-up Task": {
+      "main": [
+        [
+          {
+            "node": "Zoho - Create Task",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Fallback Record": {
+      "main": [
+        [
+          {
+            "node": "Fallback - Queue in Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fallback - Queue in Google Sheet": {
+      "main": [
+        [
+          {
+            "node": "Alert - CRM Write Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {}
+}

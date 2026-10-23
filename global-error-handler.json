@@ -1,0 +1,128 @@
+{
+  "name": "Global Error Handler (Selective Email Alerts)",
+  "nodes": [
+    {
+      "id": "c7ad36f6-c51d-4975-8864-3f412098ecd1",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "3bf8328d-94c4-41ce-becb-23781d1d0020",
+      "name": "Classify & Throttle",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "jsCode": "\nconst d = $input.first().json;\nconst msg = (d.execution?.error?.message || '').toString();\nconst node = d.execution?.lastNodeExecuted || 'unknown';\nconst wf = d.workflow?.name || 'unknown';\n\nconst critical = /401|403|unauthori[sz]ed|invalid[_ ]?token|oauth|credential|expired|insufficient|payment|quota/i.test(msg);\nconst crmFail = /zoho|crm/i.test(node);\n// Non-critical: enrichment nodes already have fallbacks, so don't wake anyone up unless it's an auth/quota issue\nconst suppress = /apollo|hunter|enrich/i.test(node) && !critical;\n\n// Throttle: same error at most once per 30 min\nconst sd = $getWorkflowStaticData('global');\nsd.seen = sd.seen || {};\nconst key = `${wf}|${node}|${msg.slice(0, 80)}`;\nconst now = Date.now();\nconst throttled = now - (sd.seen[key] || 0) < 30 * 60 * 1000;\nconst shouldAlert = !suppress && !throttled;\nif (shouldAlert) sd.seen[key] = now;\nfor (const k of Object.keys(sd.seen)) if (now - sd.seen[k] > 86400000) delete sd.seen[k];\n\nreturn [{ json: { shouldAlert, severity: critical ? 'CRITICAL' : crmFail ? 'HIGH' : 'MEDIUM',\n  wf, node, msg, url: d.execution?.url, executionId: d.execution?.id } }];\n"
+      }
+    },
+    {
+      "id": "e12e0432-682e-4651-a29e-6ed092622c6d",
+      "name": "Should Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "7095bbc3-7941-400e-ac49-293ba430a935",
+              "leftValue": "={{ $json.shouldAlert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "86580d5a-17a2-4660-b3bf-1c4352602554",
+      "name": "Send Error Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "alerts@yourcompany.com",
+        "subject": "=[{{ $json.severity }}] n8n failure: {{ $json.wf }} -> {{ $json.node }}",
+        "emailType": "text",
+        "message": "=Workflow: {{ $json.wf }}\nFailed node: {{ $json.node }}\nSeverity: {{ $json.severity }}\nExecution: {{ $json.executionId }}\nLink: {{ $json.url }}\n\nError: {{ $json.msg }}",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Classify & Throttle",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify & Throttle": {
+      "main": [
+        [
+          {
+            "node": "Should Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Alert?": {
+      "main": [
+        [
+          {
+            "node": "Send Error Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
